@@ -251,3 +251,87 @@ model PaymentMethod {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
+
+/// ------------------------------------------------------------
+/// Additional models to support full platform features
+/// Conversations, Messages, File uploads, Integrations and
+/// Telegram support. These models are intentionally simple and
+/// can be extended later as needed. Each model includes
+/// sensible defaults and relations to allow linking messages
+/// to conversations and files as well as storing integration
+/// credentials. See README for migration instructions.
+
+model Conversation {
+  /// Unique identifier for the conversation
+  id          String    @id @default(cuid())
+  /// Optional human friendly name
+  name        String?
+  /// Status of the conversation (active, archived, etc)
+  status      String    @default("active")
+  /// Messages that belong to this conversation
+  messages    Message[]
+  /// Files uploaded and linked to this conversation
+  files       File[]
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
+
+model Message {
+  /// Unique identifier for the message
+  id             String       @id @default(cuid())
+  /// Conversation this message belongs to
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  /// Role of the sender: user, assistant, system
+  role           String
+  /// Content of the message
+  content        String?
+  /// Optional JSON array of file identifiers associated with this message
+  fileIds        Json?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  @@index([conversationId])
+}
+
+model File {
+  /// Unique identifier for the file
+  id             String       @id @default(cuid())
+  /// Original file name
+  name           String
+  /// File size in bytes
+  size           Int
+  /// MIME type
+  contentType    String
+  /// URL or path where the file is stored
+  url            String?
+  /// Optional reference back to a conversation
+  conversationId String?
+  conversation   Conversation? @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  @@index([conversationId])
+}
+
+model Integration {
+  /// Unique identifier for the integration
+  id        String   @id @default(cuid())
+  /// Name of the integration provider (e.g. telegram)
+  provider  String
+  /// JSON settings required to configure the integration
+  settings  Json     @default("{}")
+  /// Whether the integration is currently enabled
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model TelegramIntegration {
+  /// Unique identifier for the Telegram integration
+  id            String   @id @default(cuid())
+  /// Bot token used to call Telegram API
+  botToken      String
+  /// Optional secret used to verify incoming webhooks
+  webhookSecret String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}

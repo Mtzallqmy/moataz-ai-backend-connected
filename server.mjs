@@ -353,6 +353,91 @@ async function handleApi(req, method, path) {
   if (a === "billing" && b === "payments" && method === "GET") { const rows = await prisma.paymentMethod.findMany(); return json(rows.map(r => ({ id: r.id, type: "card", brand: r.brand, last4: r.last4, expiryMonth: r.expMonth, expiryYear: r.expYear, isDefault: r.isDefault }))); }
   if (a === "docs" && method === "GET") return json([{ id: "quickstart", slug: "quickstart", title: "Quickstart", description: "Deploy, add a provider key, and test the Playground.", category: "Getting Started", content: "Add a provider API key from Providers, create a gateway key from API Keys, then test real chat completions in Playground.", order: 1, updatedAt: new Date().toISOString() }]);
 
+  // ------------------------------------------------------------------
+  // Conversation and messaging endpoints
+  // Provides CRUD operations for conversations and their messages.
+  if (a === "conversations" && method === "GET" && !b) {
+    // Return a list of conversations with basic info and counts
+    const convs = await prisma.conversation.findMany({ orderBy: { updatedAt: "desc" } });
+    return json(convs.map(c => ({ id: c.id, name: c.name, status: c.status, createdAt: c.createdAt?.toISOString?.(), updatedAt: c.updatedAt?.toISOString?.() })));
+  }
+  if (a === "conversations" && method === "POST" && !b) {
+    const input = await body(req);
+    const conv = await prisma.conversation.create({ data: { name: input.name || "New Conversation", status: input.status || "active" } });
+    return json({ id: conv.id, name: conv.name, status: conv.status, createdAt: conv.createdAt.toISOString() }, 201);
+  }
+  if (a === "conversations" && b && c === "messages" && method === "GET") {
+    // List messages for a conversation
+    const messages = await prisma.message.findMany({ where: { conversationId: b }, orderBy: { createdAt: "asc" } });
+    return json(messages.map(m => ({ id: m.id, role: m.role, content: m.content, fileIds: m.fileIds || [], createdAt: m.createdAt.toISOString() })));
+  }
+  if (a === "conversations" && b && c === "messages" && method === "POST") {
+    const convo = await prisma.conversation.findUnique({ where: { id: b } });
+    if (!convo) return error("Conversation not found", 404, "NOT_FOUND");
+    const input = await body(req);
+    // Only allow certain roles
+    const role = input.role || "user";
+    const msg = await prisma.message.create({ data: { conversationId: b, role, content: input.content, fileIds: input.fileIds } });
+    return json({ id: msg.id, role: msg.role, content: msg.content, fileIds: msg.fileIds || [], createdAt: msg.createdAt.toISOString() }, 201);
+  }
+
+  // File upload endpoint (metadata only)
+  if (a === "files" && b === "upload" && method === "POST") {
+    const input = await body(req);
+    // Expect name, size, contentType, optional conversationId and url
+    if (!input.name || typeof input.size !== "number") return error("File name and size are required", 422, "VALIDATION_ERROR");
+    const file = await prisma.file.create({ data: { name: input.name, size: input.size, contentType: input.contentType || "application/octet-stream", url: input.url, conversationId: input.conversationId } });
+    return json({ id: file.id, name: file.name, size: file.size, contentType: file.contentType, url: file.url, conversationId: file.conversationId }, 201);
+  }
+
+  // Integrations management
+  if (a === "integrations" && method === "GET" && !b) {
+    // Return list of configured integrations (currently just telegram)
+    const tele = await prisma.telegramIntegration.findMany();
+    return json({ telegram: tele.map(t => ({ id: t.id, botTokenMasked: mask(t.botToken), webhookSecret: t.webhookSecret })) });
+  }
+  if (a === "integrations" && b === "telegram" && method === "POST" && !c) {
+    const input = await body(req);
+    if (!input.botToken) return error("botToken is required", 422, "VALIDATION_ERROR");
+    // Upsert telegram integration (only one record)
+    let row;
+    const existing = await prisma.telegramIntegration.findFirst();
+    if (existing) {
+      row = await prisma.telegramIntegration.update({ where: { id: existing.id }, data: { botToken: input.botToken, webhookSecret: input.webhookSecret || existing.webhookSecret } });
+    } else {
+      row = await prisma.telegramIntegration.create({ data: { botToken: input.botToken, webhookSecret: input.webhookSecret } });
+    }
+    return json({ id: row.id, botTokenMasked: mask(row.botToken), webhookSecret: row.webhookSecret }, 201);
+  }
+  if (a === "integrations" && b === "telegram" && c === "test" && method === "POST") {
+    const input = await body(req);
+    // Use provided token or one saved in DB
+    const tele = await prisma.telegramIntegration.findFirst();
+    const token = input.botToken || tele?.botToken;
+    if (!token) return error("No Telegram bot token configured", 400, "MISSING_TELEGRAM_TOKEN");
+    try {
+      const resp = await fetch(`https://api.telegram.org/bot${token}/getMe`, { signal: AbortSignal.timeout(8000) });
+      const data = await resp.json();
+      if (!resp.ok || !data.ok) return error(data?.description || "Failed to call Telegram", 500, "TELEGRAM_ERROR", data);
+      return json({ ok: true, username: data.result?.username });
+    } catch (e) {
+      return error(e?.message || "Telegram test failed", 500, "TELEGRAM_ERROR");
+    }
+  }
+  if (a === "integrations" && b === "telegram" && c === "webhook" && method === "POST") {
+    // Basic webhook handler: record the incoming message and respond with 200
+    const update = await body(req);
+    // Extract chat id and message text
+    const message = update?.message;
+    const chatId = message?.chat?.id;
+    const text = message?.text;
+    if (chatId && text) {
+      // For now just log the message
+      await createLog({ providerName: "telegram", message: `Telegram message from ${chatId}: ${text}`, metadata: update });
+    }
+    return json({ ok: true });
+  }
+
   return error(`Endpoint not found: /api/${path.join("/")}`, 404, "NOT_FOUND");
 }
 
