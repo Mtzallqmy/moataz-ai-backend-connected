@@ -12,9 +12,10 @@ import { getPreset, normalizeProviderType, providerPresets } from "./presets.js"
 import { listProviderModels, callProviderChat, testProviderConnection, fallbackModels } from "./ai.js";
 import { toProvider, toApiKey, toLog } from "./mappers.js";
 
-const app = express();
+export const apiApp = express();
+const app = apiApp;
 
-app.use(helmet());
+app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
 app.use(cors({
   origin: config.frontendOrigin === "*" ? true : config.frontendOrigin.split(",").map((s) => s.trim()),
   credentials: true,
@@ -84,9 +85,158 @@ async function logUsage({
   });
 }
 
+async function readUrlText(url) {
+  const parsed = new URL(url);
+  if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("Only http and https URLs are allowed.");
+  const r = await fetch(parsed.toString(), {
+    headers: {
+      "User-Agent": "Moataz-AI-Agent/1.0 (+Railway)",
+      Accept: "text/html,application/xhtml+xml,application/xml,text/plain;q=0.9,*/*;q=0.8",
+    },
+    redirect: "follow",
+  });
+  if (!r.ok) throw new Error(`Browser fetch failed with HTTP ${r.status}.`);
+  const contentType = r.headers.get("content-type") || "";
+  const raw = await r.text();
+  const text = raw
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim();
+  const title = raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.replace(/\s+/g, " ").trim() || parsed.hostname;
+  return { url: parsed.toString(), title, contentType, text: text.slice(0, 12000), fetchedAt: new Date().toISOString() };
+}
+
+async function getDefaultProviderForUser(userId) {
+  const { data, error } = await supabase
+    .from("providers")
+    .select("*")
+    .eq("user_id", userId)
+    .in("status", ["active", "pending"])
+    .order("updated_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) return null;
+  return data;
+}
+
+async function requirePublicApiKey(req, res, next) {
+  try {
+    const bearer = (req.headers.authorization || "").startsWith("Bearer ")
+      ? req.headers.authorization.slice(7).trim()
+      : "";
+    const key = bearer || req.headers["x-api-key"] || "";
+    if (!key) return fail(res, 401, "UNAUTHORIZED", "Use Authorization: Bearer <gateway_api_key>.");
+
+    const { data, error } = await supabase
+      .from("app_api_keys")
+      .select("*")
+      .eq("key_hash", hashKey(String(key)))
+      .eq("status", "active")
+      .maybeSingle();
+
+    if (error || !data) return fail(res, 401, "UNAUTHORIZED", "Invalid or revoked gateway API key.");
+    if (data.expires_at && new Date(data.expires_at).getTime() < Date.now()) {
+      return fail(res, 401, "UNAUTHORIZED", "Gateway API key has expired.");
+    }
+    if (data.usage_limit && Number(data.usage_count || 0) >= Number(data.usage_limit)) {
+      return fail(res, 429, "USAGE_LIMIT", "Gateway API key usage limit reached.");
+    }
+
+    req.gatewayKey = data;
+    req.user = { id: data.user_id };
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
 // Public backend health route
-app.get("/", (_req, res) => ok(res, { name: "Moataz AI Backend", status: "ok" }));
+app.get("/", (_req, res) => ok(res, { name: "Moataz AI Fullstack", status: "ok", ui: "Next.js", api: "Express/Supabase" }));
 app.get("/api/healthz", (_req, res) => ok(res, { status: "ok", time: new Date().toISOString() }));
+
+// OpenAI-compatible public gateway routes for CLI tools, OpenCode, Continue, Cursor-like clients and scripts.
+// Use an app API key generated from the dashboard as Authorization: Bearer mk_...
+app.get("/v1/models", requirePublicApiKey, asyncRoute(async (req, res) => {
+  const { data, error } = await supabase
+    .from("providers")
+    .select("*")
+    .eq("user_id", req.gatewayKey.user_id)
+    .order("created_at", { ascending: false });
+  if (error) return fail(res, 500, "DB_ERROR", error.message);
+  const models = (data || []).flatMap((provider) => fallbackModels(provider).map((m) => ({
+    id: m.slug,
+    object: "model",
+    created: Math.floor(new Date(m.createdAt).getTime() / 1000),
+    owned_by: provider.name,
+    provider_id: provider.id,
+  })));
+  return res.json({ object: "list", data: models });
+}));
+
+app.post("/v1/chat/completions", requirePublicApiKey, asyncRoute(async (req, res) => {
+  const schema = z.object({
+    model: z.string().optional(),
+    providerId: z.string().uuid().optional(),
+    messages: z.array(z.object({ role: z.string(), content: z.any() })).min(1),
+    temperature: z.number().optional(),
+    max_tokens: z.number().optional(),
+    maxTokens: z.number().optional(),
+    top_p: z.number().optional(),
+    stream: z.boolean().optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return fail(res, 400, "INVALID_INPUT", "Invalid OpenAI-compatible request.", parsed.error.flatten());
+
+  let provider = null;
+  let model = parsed.data.model || "";
+
+  if (parsed.data.providerId) {
+    provider = await getProviderForUser(req.gatewayKey.user_id, parsed.data.providerId);
+  }
+
+  // Optional convention: model can be "provider_uuid:model-name".
+  if (!provider && model.includes(":")) {
+    const [maybeProviderId, ...rest] = model.split(":");
+    if (/^[0-9a-f-]{36}$/i.test(maybeProviderId)) {
+      provider = await getProviderForUser(req.gatewayKey.user_id, maybeProviderId);
+      model = rest.join(":") || provider?.default_model || model;
+    }
+  }
+
+  if (!provider) provider = await getDefaultProviderForUser(req.gatewayKey.user_id);
+  if (!provider) return fail(res, 404, "NO_PROVIDER", "Add and test at least one provider before using /v1.");
+
+  const started = Date.now();
+  const apiKey = decryptSecret(provider.api_key_encrypted);
+  const result = await callProviderChat(provider, apiKey, {
+    modelId: model || provider.default_model,
+    messages: parsed.data.messages.map((m) => ({ role: m.role, content: typeof m.content === "string" ? m.content : JSON.stringify(m.content) })),
+    temperature: parsed.data.temperature,
+    maxTokens: parsed.data.max_tokens ?? parsed.data.maxTokens,
+    topP: parsed.data.top_p,
+  });
+  const latencyMs = Date.now() - started;
+
+  await supabase
+    .from("app_api_keys")
+    .update({ usage_count: Number(req.gatewayKey.usage_count || 0) + 1, last_used_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+    .eq("id", req.gatewayKey.id);
+
+  await logUsage({ userId: req.gatewayKey.user_id, provider, modelId: result.model, latencyMs, usage: result.usage, path: "/v1/chat/completions" });
+
+  return res.json({
+    id: `chatcmpl_${Date.now()}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: result.model,
+    choices: [{ index: 0, message: { role: "assistant", content: result.content }, finish_reason: "stop" }],
+    usage: result.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  });
+}));
 
 // Auth
 app.post("/api/auth/register", asyncRoute(async (req, res) => {
@@ -481,6 +631,109 @@ app.post("/api/playground/chat", requireAuth, asyncRoute(async (req, res) => {
       status: "error",
       errorMessage: err.message,
     });
+    return fail(res, 502, "PROVIDER_ERROR", err.message);
+  }
+}));
+
+// Browser and agent tools
+app.post("/api/tools/browser", requireAuth, asyncRoute(async (req, res) => {
+  const schema = z.object({ url: z.string().url() });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return fail(res, 400, "INVALID_INPUT", "A valid URL is required.", parsed.error.flatten());
+  const page = await readUrlText(parsed.data.url);
+  await insertAudit(req.user.id, "tool.browser", "url", page.url, { title: page.title });
+  return ok(res, page);
+}));
+
+app.post("/api/agent/run", requireAuth, asyncRoute(async (req, res) => {
+  const schema = z.object({
+    providerId: z.string().uuid(),
+    modelId: z.string().min(1),
+    messages: z.array(z.object({ role: z.string(), content: z.string() })).min(1),
+    temperature: z.number().optional(),
+    maxTokens: z.number().optional(),
+    topP: z.number().optional(),
+    tools: z.object({
+      browserUrl: z.string().url().optional().or(z.literal("")),
+      repositoryId: z.string().uuid().optional().or(z.literal("")),
+      repositoryPath: z.string().optional(),
+      repositoryRef: z.string().optional(),
+      codeDraft: z.string().optional(),
+      mode: z.enum(["chat", "agent", "code", "research"]).optional(),
+    }).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return fail(res, 400, "INVALID_INPUT", "Invalid agent request.", parsed.error.flatten());
+
+  const provider = await getProviderForUser(req.user.id, parsed.data.providerId);
+  if (!provider) return fail(res, 404, "NOT_FOUND", "Provider not found.");
+
+  const toolContext = [];
+  const tools = parsed.data.tools || {};
+
+  if (tools.browserUrl) {
+    try {
+      const page = await readUrlText(tools.browserUrl);
+      toolContext.push(`BROWSER PAGE\nURL: ${page.url}\nTITLE: ${page.title}\nCONTENT:\n${page.text}`);
+    } catch (err) {
+      toolContext.push(`BROWSER ERROR for ${tools.browserUrl}: ${err.message}`);
+    }
+  }
+
+  if (tools.repositoryId && tools.repositoryPath) {
+    const conn = await getRepoConnection(req.user.id, tools.repositoryId);
+    if (conn) {
+      const token = decryptSecret(conn.token_encrypted);
+      const ref = tools.repositoryRef || conn.default_branch;
+      const url = `https://api.github.com/repos/${conn.owner}/${conn.repo}/contents/${encodeURIComponent(tools.repositoryPath).replace(/%2F/g, "/")}?ref=${encodeURIComponent(ref)}`;
+      const gh = await fetch(url, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          "User-Agent": "Moataz-AI-Gateway",
+        },
+      }).then(async (r) => ({ ok: r.ok, status: r.status, data: await r.json().catch(() => ({})) }));
+      if (gh.ok) {
+        const content = gh.data.content ? Buffer.from(gh.data.content, "base64").toString("utf8") : "";
+        toolContext.push(`REPOSITORY FILE\nREPO: ${conn.owner}/${conn.repo}\nPATH: ${tools.repositoryPath}\nREF: ${ref}\nCONTENT:\n${content.slice(0, 14000)}`);
+      } else {
+        toolContext.push(`REPOSITORY ERROR: ${gh.data?.message || gh.status}`);
+      }
+    }
+  }
+
+  if (tools.codeDraft) {
+    toolContext.push(`USER CODE DRAFT / SANDBOX BUFFER:\n${tools.codeDraft.slice(0, 14000)}`);
+  }
+
+  const system = {
+    role: "system",
+    content: `You are Moataz Agent, a production coding and research agent. Mode: ${tools.mode || "agent"}. Use the provided tool context when available. When editing code, return exact files and patches. Never invent tool results.`,
+  };
+
+  const messages = [
+    system,
+    ...(toolContext.length ? [{ role: "system", content: `Tool context follows:\n\n${toolContext.join("\n\n---\n\n")}` }] : []),
+    ...parsed.data.messages,
+  ];
+
+  const started = Date.now();
+  try {
+    const result = await callProviderChat(provider, decryptSecret(provider.api_key_encrypted), {
+      modelId: parsed.data.modelId,
+      messages,
+      temperature: parsed.data.temperature,
+      maxTokens: parsed.data.maxTokens,
+      topP: parsed.data.topP,
+    });
+    const latencyMs = Date.now() - started;
+    await logUsage({ userId: req.user.id, provider, modelId: result.model, latencyMs, usage: result.usage, path: "/api/agent/run" });
+    await supabase.from("chat_messages").insert({ user_id: req.user.id, provider_id: provider.id, model_id: result.model, role: "assistant", content: result.content });
+    return ok(res, { content: result.content, model: result.model, provider: provider.name, latencyMs, toolContextCount: toolContext.length });
+  } catch (err) {
+    const latencyMs = Date.now() - started;
+    await logUsage({ userId: req.user.id, provider, modelId: parsed.data.modelId, latencyMs, usage: null, status: "error", errorMessage: err.message, path: "/api/agent/run" });
     return fail(res, 502, "PROVIDER_ERROR", err.message);
   }
 }));
@@ -1018,6 +1271,12 @@ app.use((err, _req, res, _next) => {
   return fail(res, 500, "INTERNAL_ERROR", err.message || "Unexpected server error.");
 });
 
-app.listen(config.port, () => {
-  console.log(`Moataz AI backend listening on port ${config.port}`);
-});
+export function startApiServer(port = config.port) {
+  return app.listen(port, () => {
+    console.log(`Moataz AI backend listening on port ${port}`);
+  });
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  startApiServer();
+}
